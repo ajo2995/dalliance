@@ -11,6 +11,7 @@
 
 var bin = require('./bin');
 var bam = require('./bam');
+var cram = require('./cram');
 var bigwig = require('./bigwig');
 var encode = require('./encode');
 var utils = require('./utils');
@@ -68,6 +69,30 @@ self.onmessage = function(event) {
                 postMessage({tag: tag, error: err || "Couldn't fetch BAM"});
             }
         });
+      } else if (command === 'connectCRAM') {
+          var id = newID();
+          var resolver;
+          if (d.resolver) {
+              resolver = proxyResolver(d.resolver);
+          }
+          var cramF, craiF, indexChunks;
+          if (d.blob) {
+              cramF = new bin.BlobFetchable(d.blob);
+              craiF = new bin.BlobFetchable(d.indexBlob);
+          } else {
+              cramF = new bin.URLFetchable(d.uri, {credentials: d.credentials, resolver: resolver});
+              craiF = new bin.URLFetchable(d.indexUri, {credentials: d.credentials, resolver: resolver});
+              indexChunks = d.indexChunks;
+          }
+
+          cram.makeCram(cramF, craiF, indexChunks, function(cramObj, err) {
+              if (cramObj) {
+                  connections[id] = new CRAMWorkerFetcher(bamObj);
+                  postMessage({tag: tag, result: id});
+              } else {
+                  postMessage({tag: tag, error: err || "Couldn't fetch CRAM"});
+              }
+          });
     } else if (command === 'connectBBI') {
         var id = newID();
         var resolver;

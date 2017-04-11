@@ -296,6 +296,12 @@ TrackHubTrack.prototype.toDallianceSource = function() {
                 source.credentials = true;
             }
             return source;
+        } else if (typeToks[0] == 'cram' && this.bigDataUrl) {
+            source.cramURI = relativeURL(this._db.absURL, this.bigDataUrl);
+            if (this._db.credentials) {
+                source.credentials = true;
+            }
+            return source;
         } else if (typeToks[0] == 'vcfTabix' && this.bigDataUrl) {
             source.uri = relativeURL(this._db.absURL, this.bigDataUrl);
             source.tier_type = 'tabix';

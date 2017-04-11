@@ -45,6 +45,10 @@ if (typeof(require) !== 'undefined') {
     var makeBam = bam.makeBam;
     var BamFlags = bam.BamFlags;
 
+    var cram = require('./cram');
+    var makeCram = cram.makeCram;
+    var CramFlags = cram.CramFlags;
+
     var spans = require('./spans');
     var Range = spans.Range;
     var union = spans.union;
@@ -133,6 +137,12 @@ Browser.prototype.createSources = function(config) {
             fs = new RemoteBAMFeatureSource(config, worker, this);
         else
             fs = new BAMFeatureSource(config);
+    } else if (config.cramURI || config.cramBlob) {
+        var worker = this.getWorker();
+        if (worker)
+            fs = new RemoteCRAMFeatureSource(config, worker, this);
+        else
+            fs = new CRAMFeatureSource(config);
     } else if (config.jbURI) {
         fs = new JBrowseFeatureSource(config);
     } else if (config.uri || config.features_uri) {
@@ -1544,6 +1554,256 @@ RemoteBAMFeatureSource.prototype.getStyleSheet = function(callback) {
     });
 };
 
+function CRAMFeatureSource(cramSource) {
+    FeatureSourceBase.call(this);
+
+    var thisB = this;
+    this.cramSource = cramSource;
+    this.opts = {credentials: cramSource.credentials, preflight: cramSource.preflight, cramGroup: cramSource.cramGroup};
+    this.cramHolder = new Awaited();
+    
+    if (this.opts.preflight) {
+        var pfs = bwg_preflights[this.opts.preflight];
+        if (!pfs) {
+            pfs = new Awaited();
+            bwg_preflights[this.opts.preflight] = pfs;
+
+            var req = new XMLHttpRequest();
+            req.onreadystatechange = function() {
+                if (req.readyState == 4) {
+                    if (req.status == 200) {
+                        pfs.provide('success');
+                    } else {
+                        pfs.provide('failure');
+                    }
+                }
+            };
+            // req.setRequestHeader('cache-control', 'no-cache');    /* Doesn't work, not an allowed request header in CORS */
+            req.open('get', this.opts.preflight + '?' + hex_sha1('salt' + Date.now()), true);    // Instead, ensure we always preflight a unique URI.
+            if (this.opts.credentials) {
+                req.withCredentials = 'true';
+            }
+            req.send();
+        }
+        pfs.await(function(status) {
+            if (status === 'success') {
+                thisB.init();
+            }
+        });
+    } else {
+        thisB.init();
+    }
+}
+
+CRAMFeatureSource.prototype = Object.create(FeatureSourceBase.prototype);
+
+CRAMFeatureSource.prototype.init = function() {
+    var thisB = this;
+    var cramF, craiF;
+    if (this.cramSource.cramBlob) {
+        cramF = new BlobFetchable(this.cramSource.cramBlob);
+        craiF = new BlobFetchable(this.cramSource.craiBlob);
+    } else {
+        cramF = new URLFetchable(this.cramSource.cramURI, {credentials: this.opts.credentials, resolver: this.opts.resolver});
+        craiF = new URLFetchable(this.cramSource.craiURI || (this.cramSource.cramURI + '.crai'), 
+                                {credentials: this.opts.credentials, resolver: this.opts.resolver});
+    }
+    makeCram(cramF, craiF, null, function(cram, err) {
+        thisB.readiness = null;
+        thisB.notifyReadiness();
+
+        if (cram) {
+            thisB.cramHolder.provide(cram);
+        } else {
+            thisB.error = err;
+            thisB.cramHolder.provide(null);
+        }
+    });
+};
+
+CRAMFeatureSource.prototype.fetch = function(chr, min, max, scale, types, pool, callback) {
+    var light = types && (types.length == 1) && (types[0] == 'density');
+
+    var thisB = this;
+    
+    thisB.busy++;
+    thisB.notifyActivity();
+    
+    this.cramHolder.await(function(cram) {
+        if (!cram) {
+            thisB.busy--;
+            thisB.notifyActivity();
+            return callback(thisB.error || "Couldn't fetch CRAM");
+        }
+
+        cram.fetch(chr, min, max, function(cramRecords, error) {
+            thisB.busy--;
+            thisB.notifyActivity();
+
+            if (error) {
+                callback(error, null, null);
+            } else {
+                var features = [];
+                for (var ri = 0; ri < cramRecords.length; ++ri) {
+                    var r = cramRecords[ri];
+
+                    var f = cramRecordToFeature(r, thisB.opts.cramGroup);
+                    if (f)
+                        features.push(f);
+                }
+                callback(null, features, 1000000000);
+            }
+        }, {light: light});
+    });
+};
+
+CRAMFeatureSource.prototype.getScales = function() {
+    return 1000000000;
+};
+
+CRAMFeatureSource.prototype.getStyleSheet = function(callback) {
+    this.cramHolder.await(function(cram) {
+        var stylesheet = new DASStylesheet();
+                
+        var densStyle = new DASStyle();
+        densStyle.glyph = 'HISTOGRAM';
+        densStyle.COLOR1 = 'black';
+        densStyle.COLOR2 = 'red';
+        densStyle.HEIGHT=30;
+        stylesheet.pushStyle({type: 'density'}, 'low', densStyle);
+        stylesheet.pushStyle({type: 'density'}, 'medium', densStyle);
+
+        var wigStyle = new DASStyle();
+        wigStyle.glyph = '__SEQUENCE';
+        wigStyle.FGCOLOR = 'black';
+        wigStyle.BGCOLOR = 'blue';
+        wigStyle.HEIGHT = 8;
+        wigStyle.BUMP = true;
+        wigStyle.LABEL = false;
+        wigStyle.ZINDEX = 20;
+        stylesheet.pushStyle({type: 'cram'}, 'high', wigStyle);
+
+        return callback(stylesheet);
+    });
+};
+
+
+function RemoteCRAMFeatureSource(cramSource, worker) {
+    FeatureSourceBase.call(this);
+
+    var thisB = this;
+    this.cramSource = cramSource;
+    this.worker = worker;
+    this.opts = {credentials: cramSource.credentials, preflight: cramSource.preflight, cramGroup: cramSource.cramGroup};
+    this.keyHolder = new Awaited();
+    
+    if (cramSource.resolver) {
+        this.resolverKey = browser.registerResolver(cramSource.resolver);
+    }
+
+    this.init();
+}
+
+RemoteCRAMFeatureSource.prototype = Object.create(FeatureSourceBase.prototype);
+
+RemoteCRAMFeatureSource.prototype.init = function() {    var thisB = this;
+    var uri = this.cramSource.uri || this.cramSource.cramURI;
+    var indexUri = this.cramSource.indexUri || this.cramSource.craiURI || uri + '.crai';
+
+    var blob = this.cramSource.cramBlob || this.cramSource.blob;
+    var indexBlob = this.cramSource.craiBlob || this.cramSource.indexBlob;
+
+    var cnt = function(result, err) {
+        thisB.readiness = null;
+        thisB.notifyReadiness();
+
+        if (result) {
+            thisB.keyHolder.provide(result);
+        } else {
+            thisB.error = err;
+            thisB.keyHolder.provide(null);
+        }
+    };
+
+    if (blob) {
+        this.worker.postCommand({command: 'connectCRAM', blob: blob, indexBlob: indexBlob}, cnt);
+    } else {
+        this.worker.postCommand({
+            command: 'connectCRAM', 
+            uri: resolveUrlToPage(uri), 
+            resolver: this.resolverKey,
+            indexUri: resolveUrlToPage(indexUri),
+            credentials: this.cramSource.credentials,
+            indexChunks: this.cramSource.indexChunks},
+          cnt); 
+    }
+};
+
+RemoteCRAMFeatureSource.prototype.fetch = function(chr, min, max, scale, types, pool, callback) {
+    var light = types && (types.length == 1) && (types[0] == 'density');
+    var thisB = this;
+    
+    thisB.busy++;
+    thisB.notifyActivity();
+    
+    this.keyHolder.await(function(key) {
+        if (!key) {
+            thisB.busy--;
+            thisB.notifyActivity();
+            return callback(thisB.error || "Couldn't fetch CRAM");
+        }
+
+        thisB.worker.postCommand({command: 'fetch', connection: key, chr: chr, min: min, max: max, opts: {light: light}}, function(cramRecords, error) {
+            // console.log('retrieved ' + cramRecords.length + ' via worker.');
+
+            thisB.busy--;
+            thisB.notifyActivity();
+
+            if (error) {
+                callback(error, null, null);
+            } else {
+                var features = [];
+                for (var ri = 0; ri < cramRecords.length; ++ri) {
+                    var r = cramRecords[ri];
+                    var f = cramRecordToFeature(r, thisB.opts.cramGroup);
+                    if (f)
+                        features.push(f);
+                }
+                callback(null, features, 1000000000);
+            }
+        });
+    });
+};
+
+RemoteCRAMFeatureSource.prototype.getScales = function() {
+    return 1000000000;
+};
+
+RemoteCRAMFeatureSource.prototype.getStyleSheet = function(callback) {
+    this.keyHolder.await(function(cram) {
+        var stylesheet = new DASStylesheet();
+                
+        var densStyle = new DASStyle();
+        densStyle.glyph = 'HISTOGRAM';
+        densStyle.COLOR1 = 'black';
+        densStyle.COLOR2 = 'red';
+        densStyle.HEIGHT=30;
+        stylesheet.pushStyle({type: 'density'}, 'low', densStyle);
+        stylesheet.pushStyle({type: 'density'}, 'medium', densStyle);
+
+        var wigStyle = new DASStyle();
+        wigStyle.glyph = '__SEQUENCE';
+        wigStyle.FGCOLOR = 'black';
+        wigStyle.BGCOLOR = 'blue';
+        wigStyle.HEIGHT = 8;
+        wigStyle.BUMP = true;
+        wigStyle.LABEL = false;
+        wigStyle.ZINDEX = 20;
+        stylesheet.pushStyle({type: 'cram'}, 'high', wigStyle);
+        return callback(stylesheet);
+    });
+};
+
 
 function MappedFeatureSource(source, mapping) {
     this.source = source;
@@ -1812,6 +2072,8 @@ if (typeof(module) !== 'undefined') {
         RemoteBWGFeatureSource: RemoteBWGFeatureSource,
         BAMFeatureSource: BAMFeatureSource,
         RemoteBAMFeatureSource: RemoteBAMFeatureSource,
+        CRAMFeatureSource: CRAMFeatureSource,
+        RemoteCRAMFeatureSource: RemoteCRAMFeatureSource,
         DummyFeatureSource: DummyFeatureSource,
         DummySequenceSource: DummySequenceSource,
 
