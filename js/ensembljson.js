@@ -62,7 +62,7 @@ EnsemblFeatureSource.prototype.getStyleSheet = function(callback) {
     cdsStyle.HEIGHT = 8;
     cdsStyle.BUMP = true;
     cdsStyle.LABEL = true;
-    cdsStyle.ZINDEX = 10;
+    cdsStyle.ZINDEX = 30;
     stylesheet.pushStyle({type: 'cds'}, null, cdsStyle);
 
     {
